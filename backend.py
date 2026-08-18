@@ -97,23 +97,40 @@ def get_emails(user_token: Optional[str] = None):
         user_data = user_response.json()
         user_id = user_data.get("id", "unknown")
 
+        messages_url = f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
 
-        # 獲取郵件（過濾：未讀 + 主旨包含 Invoice，按時間排序，最新的在前）
-        filter_query = "isRead eq false and contains(subject, 'Invoice')"
         messages_response = requests.get(
-            f"https://graph.microsoft.com/v1.0/me/messages?${'$'}filter={filter_query}&${'$'}top=50&${'$'}orderby=receivedDateTime desc",
-
+            f'{messages_url}',
+            params={
+                "$filter": "isRead eq false and contains(subject, 'Invoice')",
+                "$select": "id,conversationId,subject,receivedDateTime,from,hasAttachments, bodyPreview",
+                "$top": 50
+            },
             headers=headers
         )
         messages_response.raise_for_status()
         messages_data = messages_response.json()
         emails = []
         for message in messages_data.get("value", []):
+            # 先取得原始對話串
+            conversation_id = message.get("conversationId")
+            conversation_url = "https://graph.microsoft.com/v1.0/me/messages"
+            conversation_response = requests.get(
+                conversation_url,
+                params={
+                    "$filter": f"conversationId eq '{conversation_id}'"
+                },
+                headers=headers
+            )
+            conversation_response.raise_for_status()
+            conversation_data = conversation_response.json()
+
+        for convesation in conversation_data.get("value", []):
             # 獲取附件
             attachments = []
-            if message.get("hasAttachments"):
+            if convesation.get("hasAttachments"):
                 attachments_response = requests.get(
-                    f"https://graph.microsoft.com/v1.0/me/messages/{message['id']}/attachments",
+                    f"https://graph.microsoft.com/v1.0/me/messages/{convesation['id']}/attachments",
                     headers=headers
                 )
                 if attachments_response.status_code == 200:
@@ -126,18 +143,19 @@ def get_emails(user_token: Optional[str] = None):
                         })
 
             email_entry = {
-                "message_id": message["id"],
-                "subject": message.get("subject"),
-                "from": message.get("from", {}).get("emailAddress", {}).get("address"),
-                "received_time": message.get("receivedDateTime"),
-                "body_preview": message.get("bodyPreview"),
-                "has_attachments": message.get("hasAttachments"),
+                "message_id": convesation["id"],
+                "subject": convesation.get("subject"),
+                "from": convesation.get("from", {}).get("emailAddress", {}).get("address"),
+                "received_time": convesation.get("receivedDateTime"),
+                "body_preview": convesation.get("bodyPreview"),
+                "has_attachments": convesation.get("hasAttachments"),
                 "attachments": attachments,
             }
             emails.append(email_entry)
 
         return {
             "user_id": user_id,
+            "conversation data": conversation_data,
             "emails": emails,
         }
 
@@ -191,80 +209,170 @@ def get_attachment(message_id: str, attachment_id: str, user_token: Optional[str
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
 @app.post("/api/analyze-invoice")
-def analyze_invoice(message_id: str, attachment_id: str, attachment_name: str, user_token: Optional[str] = None):
+def analyze_invoice(
+    message_id: str,
+    attachment_id: str,
+    attachment_name: str,
+    user_token: Optional[str] = None
+):
     """
-    分析郵件附件中的發票（調用 OpenAI Vision API）
+    使用 Azure AI Document Intelligence 分析郵件附件中的發票
     """
     try:
         if not user_token:
-            raise HTTPException(status_code=401, detail="User token required")
+            raise HTTPException(
+                status_code=401,
+                detail="User token required"
+            )
 
-        from openai import OpenAI
-
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        # 先下載附件
+        # ==========================================
+        # 1. 從 Microsoft Graph 下載附件
+        # ==========================================
         headers = get_graph_headers(user_token)
+
         attachment_response = requests.get(
-            f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments/{attachment_id}",
+            f"https://graph.microsoft.com/v1.0/me/messages/"
+            f"{message_id}/attachments/{attachment_id}",
             headers=headers
         )
-        attachment_response.raise_for_status()
-        attachment_data = attachment_response.json()
-        print('取得附件成功')
-        print(f"Attachment data: {attachment_data}")
 
+        attachment_response.raise_for_status()
+
+        attachment_data = attachment_response.json()
+
+        print("取得附件成功")
+
+        # ==========================================
+        # 2. 確認是 File Attachment
+        # ==========================================
         if attachment_data.get("@odata.type") != "#microsoft.graph.fileAttachment":
             return {
                 "file": attachment_name,
                 "is_invoice": False,
-                "error": "Not a file attachment",
+                "error": "Not a file attachment"
             }
 
-        # 檢查是否是 PDF
+        # ==========================================
+        # 3. 確認 PDF
+        # ==========================================
         if not attachment_name.lower().endswith(".pdf"):
             return {
                 "file": attachment_name,
                 "is_invoice": False,
-                "error": "Not a PDF file",
+                "error": "Not a PDF file"
             }
 
-        # 用 Vision API 分析 PDF
-        pdf_content = base64.b64decode(attachment_data.get("contentBytes", ""))
-        pdf_base64 = base64.b64encode(pdf_content).decode("utf-8")
-
-        response = client.messages.create(
-            model="gpt-5.6-luna",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "document",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "application/pdf",
-                                "data": pdf_base64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "請提取這份發票的所有信息，包括：發票號碼、日期、金額、供應商名稱、貨幣。以 JSON 格式回答。"
-                        }
-                    ],
-                }
-            ],
+        # ==========================================
+        # 4. Decode Outlook attachment
+        # ==========================================
+        pdf_content = base64.b64decode(
+            attachment_data.get("contentBytes", "")
         )
 
+        # ==========================================
+        # 5. Azure Document Intelligence
+        # ==========================================
+        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        from azure.core.credentials import AzureKeyCredential
+
+        endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
+        key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
+
+        if not endpoint or not key:
+            raise HTTPException(
+                status_code=500,
+                detail="Azure Document Intelligence credentials not configured"
+            )
+
+        document_client = DocumentIntelligenceClient(
+            endpoint=endpoint,
+            credential=AzureKeyCredential(key)
+        )
+
+        poller = document_client.begin_analyze_document(
+            "prebuilt-invoice",
+            body=pdf_content
+        )
+
+        result = poller.result()
+
+        print("Azure Document Intelligence analysis completed")
+
+        # ==========================================
+        # 6. Extract Invoice Fields
+        # ==========================================
+        invoices = []
+
+        for document in result.documents:
+
+            fields = document.fields
+
+            invoice_data = {
+                "invoice_number": None,
+                "invoice_date": None,
+                "vendor_name": None,
+                "customer_name": None,
+                "total_amount": None,
+                "currency": None,
+                "due_date": None,
+            }
+
+            if fields.get("InvoiceId"):
+                invoice_data["invoice_number"] = (
+                    fields["InvoiceId"].value_string
+                )
+
+            if fields.get("InvoiceDate"):
+                invoice_data["invoice_date"] = (
+                    fields["InvoiceDate"].value_date.isoformat()
+                )
+
+            if fields.get("VendorName"):
+                invoice_data["vendor_name"] = (
+                    fields["VendorName"].value_string
+                )
+
+            if fields.get("CustomerName"):
+                invoice_data["customer_name"] = (
+                    fields["CustomerName"].value_string
+                )
+
+            if fields.get("InvoiceTotal"):
+                invoice_total = fields["InvoiceTotal"].value_currency
+
+                if invoice_total:
+                    invoice_data["total_amount"] = invoice_total.amount
+                    invoice_data["currency"] = invoice_total.currency_code
+
+            if fields.get("DueDate"):
+                invoice_data["due_date"] = (
+                    fields["DueDate"].value_date.isoformat()
+                )
+
+            invoices.append(invoice_data)
+
+        # ==========================================
+        # 7. Return result
+        # ==========================================
         return {
             "file": attachment_name,
-            "is_invoice": True,
-            "analysis": response.content[0].text,
+            "is_invoice": len(invoices) > 0,
+            "invoices": invoices
         }
 
+    except HTTPException:
+        raise
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Invoice analysis error: {str(e)}")
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 @app.get("/api/health")
 def health():
