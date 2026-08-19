@@ -100,7 +100,7 @@ def get_emails_from_outlook(user_token: Optional[str] = None):
         response = requests.get(
             f"{BACKEND_URL}/api/emails",
             params=params,
-            timeout=10,
+            timeout=30,
         )
         response.raise_for_status()
         return response.json()
@@ -193,11 +193,54 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_invoice_processed",
+            "description": "標記發票已處理，自動移動郵件到歸檔資料夾",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "郵件 ID",
+                    },
+                    "invoice_number": {
+                        "type": "string",
+                        "description": "發票號碼",
+                    },
+                    "amount": {
+                        "type": "string",
+                        "description": "發票金額",
+                    },
+                },
+                "required": ["message_id", "invoice_number"],
+            },
+        },
+    },
 ]
 
 # ============================================================
 # Tool executor
 # ============================================================
+
+def mark_invoice_processed(message_id: str, invoice_number: str, amount: str = "", user_token: Optional[str] = None):
+    """標記發票已處理，移動到歸檔資料夾"""
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/api/mark-processed",
+            params={
+                "message_id": message_id,
+                "invoice_number": invoice_number,
+                "amount": amount,
+                "user_token": user_token,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        return {"error": f"無法標記為已處理：{str(e)}"}
 
 def execute_tool(name: str, arguments: dict) -> str:
     try:
@@ -214,6 +257,15 @@ def execute_tool(name: str, arguments: dict) -> str:
             )
             return json.dumps(result, ensure_ascii=False)
 
+        if name == "mark_invoice_processed":
+            result = mark_invoice_processed(
+                arguments["message_id"],
+                arguments["invoice_number"],
+                arguments.get("amount", ""),
+                st.session_state.user_token,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
         return json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -223,45 +275,85 @@ def execute_tool(name: str, arguments: dict) -> str:
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are an AI Invoice Processing Agent.
+        You are an AI Invoice Processing Agent.
 
-Your job is to identify the latest valid invoice from an email
-conversation in Outlook.
+        Your job is to identify the latest valid invoice from an email
+        conversation in Outlook.
 
-You have access to two tools:
+        You have access to tools:
 
-1. get_emails
-   Retrieve all emails and attachments from Outlook inbox.
+        1. get_emails
+        Retrieve all unread invoice-related emails from Outlook inbox.
 
-2. analyze_invoice(message_id, attachment_id, attachment_name)
-   Analyze a PDF invoice attachment to extract invoice information.
+        2. analyze_invoice(message_id, attachment_id, attachment_name)
+        Analyze a PDF invoice attachment to extract invoice information.
 
-Important rules:
+        3. get_conversation(message_id)
+        Get the complete conversation thread for a specific message to see
+        the full history and understand if the invoice was already processed.
 
-- Do not assume that the first invoice is the valid invoice.
-- Inspect the entire email thread.
-- Consider email timestamps.
-- Identify corrected or replaced invoices.
-- Only analyze PDF attachments (ignore images, documents, etc).
-- If a later email explicitly says that an earlier invoice should
-  be disregarded, do not select the earlier invoice.
-- If multiple invoice versions exist, select the latest valid version.
-- If there is uncertainty, mark the result as "Review Required".
+        Important rules for invoice identification:
 
-At the end, provide:
+        - Do not assume that the first invoice is the valid invoice.
+        - Inspect the entire email thread using get_conversation if needed.
+        - Consider email timestamps - LATEST invoice is usually the valid one.
 
-1. Selected invoice file name
-2. Invoice number
-3. Amount
-4. Supplier
-5. Processing status
-6. Reason for the decision
+        CRITICAL: Identify invoice updates/corrections:
+        - Same invoice number + different version = UPDATE (use latest)
+        - Same supplier + similar invoice number = LIKELY SAME INVOICE
+        - Look for keywords: "更新", "修正", "更正", "corrected", "updated", "revised"
+        - Compare amounts: if amount differs, it's likely an update
+        - Compare line items: if products/quantities change, it's an update
+        - Timeline: if supplier sends new invoice days after first one, treat as update
 
-Possible statuses:
+        Decision logic:
+        - If multiple versions of same invoice exist, select LATEST version
+        - If unsure if it's an update, check the conversation context
+        - Only select the FINAL, MOST RECENT valid invoice
+        - Once valid invoice identified, mark it as processed and move to archive
 
-- Completed
-- Review Required
-- Failed
+        - Only analyze PDF attachments (ignore images, documents, etc).
+        - If a later email explicitly says an earlier invoice should be disregarded, exclude it.
+        - If multiple different invoices exist, report all but indicate which is primary.
+        - If there is uncertainty, mark the result as "Review Required".
+
+        User can ask in natural language:
+        - "Show me the second email from the 3 emails"
+        - "Which of these emails has invoice attachments?"
+        - "Check the complete conversation for message X"
+        - "Find all PDF attachments in message Y"
+
+        You should understand the user's intent and use the appropriate tools.
+        When user refers to email position (first, second, third), use the order
+        from the get_emails result.
+
+        IMPORTANT: When examining any specific message:
+        - ALWAYS use get_conversation(message_id) to read the ENTIRE conversation thread
+        - Never analyze a single message in isolation
+        - You need to see the full context to understand invoice updates/corrections
+        - Check all messages in the thread to identify which is the latest valid version
+
+        After identifying the valid invoice:
+        1. Get the complete conversation thread using get_conversation
+        2. Analyze all versions in the thread
+        3. Select the LATEST valid invoice
+        4. Mark it as processed (moves to archive folder automatically)
+        5. Report the decision with complete reasoning from the thread context
+
+        At the end, provide:
+
+        1. Selected invoice file name
+        2. Invoice number
+        3. Amount
+        4. Supplier
+        5. Processing status
+        6. Reason for the decision
+
+        Possible statuses:
+
+        - Completed
+        - Review Required
+        - Failed
 """
 
 def run_agent(user_request: str):
@@ -353,6 +445,46 @@ with col3:
             logout()
     else:
         st.write("")
+
+st.divider()
+
+# ============================================================
+# 未讀發票郵件摘要（登入後顯示）
+# ============================================================
+
+if st.session_state.user_token:
+    st.subheader("📬 未讀發票郵件")
+
+    with st.spinner("載入郵件中..."):
+        emails_data = get_emails_from_outlook(st.session_state.user_token)
+
+    if emails_data and "emails" in emails_data:
+        emails_list = emails_data.get("emails", [])
+
+        if emails_list:
+            st.success(f"✉️ 找到 **{len(emails_list)}** 封未讀發票郵件")
+
+            # 顯示郵件列表
+            for idx, email in enumerate(emails_list, 1):
+                with st.expander(f"📧 [{idx}] {email['subject']}", expanded=(idx == 1)):
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.caption(f"**寄件者**: {email['from']}")
+                        st.caption(f"**時間**: {email['received_time']}")
+                        if email['body_preview']:
+                            st.caption(f"**預覽**: {email['body_preview'][:100]}...")
+
+                    with col2:
+                        if email['has_attachments']:
+                            st.markdown(f"📎 **{len(email['attachments'])} 個附件**")
+                            for att in email['attachments']:
+                                st.caption(f"• {att['name']}")
+                        else:
+                            st.caption("無附件")
+        else:
+            st.info("✅ 目前沒有未讀的發票郵件")
+    else:
+        st.error("❌ 無法載入郵件")
 
 st.divider()
 
