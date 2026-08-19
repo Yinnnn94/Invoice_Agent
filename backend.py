@@ -7,6 +7,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import base64
+import tempfile
+import pymysql
+
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -19,6 +22,28 @@ AAD_TENANT_ID = os.getenv("AAD_TENANT_ID")
 AAD_CLIENT_SECRET = os.getenv("AAD_CLIENT_SECRET")
 AAD_AUTHORITY = f"https://login.microsoftonline.com/{AAD_TENANT_ID}"
 SCOPES = ["https://graph.microsoft.com/.default"]
+SYSTEM_MAILBOX = os.getenv(
+    "SYSTEM_MAILBOX",
+    "your-system-mailbox@company.com"
+)
+DB_USER = os.getenv("DB_USER")
+DB_PW = os.getenv("DB_PW")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+DB_PORT = os.getenv("DB_PORT")
+
+### DB必須的基本資料
+db_settings = {
+    "user": DB_USER,
+    "password": DB_PW,
+    "host": DB_HOST,
+    "database": DB_NAME,
+    "port": DB_PORT,
+    "read_timeout": 5,
+}
+def get_db_connection(config):
+    return pymysql.connect(**db_settings)
+
 
 if not all([AAD_CLIENT_ID, AAD_TENANT_ID, AAD_CLIENT_SECRET]):
     raise ValueError("缺少 AAD 環境變數: AAD_CLIENT_ID, AAD_TENANT_ID, AAD_CLIENT_SECRET")
@@ -108,8 +133,12 @@ def get_emails(user_token: Optional[str] = None):
             f'{messages_url}',
             params={
                 "$filter": filter_query,
+<<<<<<< Updated upstream
                 "$select": "id,conversationId,subject,receivedDateTime,from,hasAttachments, bodyPreview",
                 "$top": 50
+=======
+                "$select": "id,conversationId,subject,receivedDateTime,from,hasAttachments, bodyPreview"
+>>>>>>> Stashed changes
             },
             headers=headers
         )
@@ -145,6 +174,7 @@ def get_emails(user_token: Optional[str] = None):
 
             # 獲取該對話串的所有郵件
             conversation_messages = conversations_cache[conversation_id]
+<<<<<<< Updated upstream
 
             # 只查當前郵件的附件（不是整個對話串）
             attachments = []
@@ -152,6 +182,16 @@ def get_emails(user_token: Optional[str] = None):
                 try:
                     attachments_response = requests.get(
                         f"https://graph.microsoft.com/v1.0/me/messages/{message['id']}/attachments",
+=======
+            # 只查當前郵件的附件（不是整個對話串）
+        print(conversation_messages)
+        for conversation in conversation_messages:
+            attachments = []
+            if conversation.get("hasAttachments"):
+                try:
+                    attachments_response = requests.get(
+                        f"https://graph.microsoft.com/v1.0/me/messages/{conversation.get('id')}/attachments",
+>>>>>>> Stashed changes
                         headers=headers,
                         timeout=5
                     )
@@ -167,12 +207,20 @@ def get_emails(user_token: Optional[str] = None):
                     pass
 
             email_entry = {
+<<<<<<< Updated upstream
                 "message_id": message["id"],
                 "subject": message.get("subject"),
                 "from": message.get("from", {}).get("emailAddress", {}).get("address"),
                 "received_time": message.get("receivedDateTime"),
                 "body_preview": message.get("bodyPreview"),
                 "has_attachments": message.get("hasAttachments"),
+=======
+                "subject": conversation.get("subject"),
+                "from": conversation.get("from", {}).get("emailAddress", {}).get("address"),
+                "received_time": conversation.get("receivedDateTime"),
+                "body_preview": conversation.get("bodyPreview"),
+                "has_attachments": conversation.get("hasAttachments"),
+>>>>>>> Stashed changes
                 "attachments": attachments,
                 "conversation_id": conversation_id,
                 "conversation_messages": [
@@ -539,6 +587,278 @@ def mark_processed(message_id: str, invoice_number: str, amount: str = "", user_
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+<<<<<<< Updated upstream
+=======
+
+
+# ============================================================
+# Database
+# ============================================================
+@app.get("/api/reconciliation-status")
+def get_reconciliation_status(invoice_number: str):
+    """
+    查詢發票目前的對帳狀態。
+    TODO: 修改 SQL statement 與 DB connection。
+    """
+
+    try:
+        # ====================================================
+        # TODO: 改成你自己的 DB connection
+        # ====================================================
+        conn = get_db_connection()
+
+        cursor = conn.cursor()
+
+        # ====================================================
+        # TODO: 修改這裡的 SQL
+        # ====================================================
+        sql = """
+            SELECT
+                invoice_number,
+                result
+            FROM n8n_result_from_process_time
+            WHERE invoice_number = %s
+            and is_latest = 1
+        """
+
+        cursor.execute(sql, (invoice_number,))
+        row = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if not row:
+            return {
+                "status": "not_found",
+                "invoice_number": invoice_number,
+                "can_auto_process": False,
+            }
+
+        # 如果你的 DB 回傳 tuple
+        db_invoice_number = row[0]
+        db_status = row[1]
+
+        # ====================================================
+        # TODO: 根據你們實際 status 修改
+        # ====================================================
+        can_auto_process = db_status in [
+            "ERP_NO_Data",
+            "R049_No_Data",
+            "Reconciliation Fail",
+        ]
+
+        return {
+            "status": "success",
+            "invoice_number": db_invoice_number,
+            "reconciliation_status": db_status,
+            "can_auto_process": can_auto_process,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "can_auto_process": False,
+        }
+
+
+@app.get("/api/download-invoice")
+def download_invoice_attachment(
+    message_id: str,
+    attachment_id: str,
+    attachment_name: str,
+    user_token: str,
+):
+    """
+    從 Microsoft Graph 下載指定附件，
+    暫存到 backend 的 temporary directory。
+    """
+
+    try:
+        if not user_token:
+            return {
+                "status": "error",
+                "error": "Missing user token",
+            }
+
+        url = (
+            "https://graph.microsoft.com/v1.0/"
+            f"me/messages/{message_id}/attachments/{attachment_id}"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+        }
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        attachment_data = response.json()
+
+        # Microsoft Graph fileAttachment
+        if attachment_data.get("@odata.type") != "#microsoft.graph.fileAttachment":
+            return {
+                "status": "error",
+                "error": "Attachment is not a file attachment",
+            }
+
+        content_bytes = attachment_data.get("contentBytes")
+
+        if not content_bytes:
+            return {
+                "status": "error",
+                "error": "Attachment does not contain contentBytes",
+            }
+
+        file_data = base64.b64decode(content_bytes)
+
+        # 暫存檔
+        temp_dir = tempfile.gettempdir()
+
+        safe_filename = os.path.basename(attachment_name)
+
+        file_path = os.path.join(
+            temp_dir,
+            safe_filename,
+        )
+
+        with open(file_path, "wb") as f:
+            f.write(file_data)
+
+        return {
+            "status": "success",
+            "file_path": file_path,
+            "file_name": safe_filename,
+            "size": len(file_data),
+        }
+
+    except requests.exceptions.RequestException as e:
+        return {
+            "status": "error",
+            "error": f"Microsoft Graph error: {str(e)}",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+@app.post("/api/send-invoice")
+def send_invoice_to_system_mailbox(
+    file_path: str,
+    file_name: str,
+    invoice_number: str,
+    user_token: str,
+):
+    """
+    將確認後的發票附件寄到系統信箱。
+    """
+
+    try:
+        if not user_token:
+            return {
+                "status": "error",
+                "error": "Missing user token",
+            }
+
+        if not os.path.exists(file_path):
+            return {
+                "status": "error",
+                "error": f"File not found: {file_path}",
+            }
+
+        # 讀取附件
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+
+        encoded_file = base64.b64encode(file_bytes).decode("utf-8")
+
+        # Microsoft Graph Send Mail
+        url = (
+            "https://graph.microsoft.com/v1.0/"
+            "me/sendMail"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "Content-Type": "application/json",
+        }
+
+        mail_payload = {
+            "message": {
+                "subject": f"Invoice - {invoice_number}",
+                "body": {
+                    "contentType": "Text",
+                    "content": (
+                        "This invoice has been identified and "
+                        "processed by the AI Invoice Agent."
+                    ),
+                },
+                "toRecipients": [
+                    {
+                        "emailAddress": {
+                            "address": SYSTEM_MAILBOX
+                        }
+                    }
+                ],
+                "attachments": [
+                    {
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": file_name,
+                        "contentType": "application/pdf",
+                        "contentBytes": encoded_file,
+                    }
+                ],
+            }
+        }
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=mail_payload,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        # Graph sendMail 成功通常會回 202
+        return {
+            "status": "success",
+            "invoice_number": invoice_number,
+            "file_name": file_name,
+            "sent_to": SYSTEM_MAILBOX,
+        }
+
+    except requests.exceptions.RequestException as e:
+        return {
+            "status": "error",
+            "error": f"Microsoft Graph error: {str(e)}",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+    finally:
+        # 清除暫存檔
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+
+
+
+>>>>>>> Stashed changes
 @app.get("/api/health")
 def health():
     """健康檢查"""

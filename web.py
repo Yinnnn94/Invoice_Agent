@@ -30,8 +30,12 @@ client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
 
 if "user_token" not in st.session_state:
     st.session_state.user_token = None
+
 if "user_info" not in st.session_state:
     st.session_state.user_info = None
+
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
 
 # ============================================================
 # AAD Authentication
@@ -151,6 +155,82 @@ def analyze_invoice_attachment(message_id: str, attachment_id: str, attachment_n
         st.error(f"無法分析發票：{str(e)}")
         return None
 
+def get_reconciliation_status(
+    invoice_number: str,
+):
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/api/reconciliation-status",
+            params={
+                "invoice_number": invoice_number,
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+    
+def download_invoice_attachment(
+    message_id: str,
+    attachment_id: str,
+    attachment_name: str,
+    user_token: Optional[str] = None,
+):
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/api/download-invoice",
+            params={
+                "message_id": message_id,
+                "attachment_id": attachment_id,
+                "attachment_name": attachment_name,
+                "user_token": user_token,
+            },
+            timeout=30,
+        )
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+def send_invoice_to_system_mailbox(
+    file_path: str,
+    file_name: str,
+    invoice_number: str,
+    user_token: Optional[str] = None,
+):
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/api/send-invoice",
+            params={
+                "file_path": file_path,
+                "file_name": file_name,
+                "invoice_number": invoice_number,
+                "user_token": user_token,
+            },
+            timeout=30,
+        )
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
 # ============================================================
 # Tool definitions for the LLM
 # ============================================================
@@ -218,6 +298,90 @@ TOOLS = [
             },
         },
     },
+    {
+    "type": "function",
+    "function": {
+        "name": "get_reconciliation_status",
+        "description": (
+            "查詢指定發票目前在發票對帳資料庫中的狀態。"
+            "在處理更新版發票之前，必須先查詢此狀態。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "invoice_number": {
+                    "type": "string",
+                    "description": "發票號碼",
+                }
+            },
+            "required": ["invoice_number"],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "download_invoice_attachment",
+        "description": (
+            "從 Outlook 下載指定的發票附件。"
+            "只能下載已確認為有效發票的附件。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "string",
+                    "description": "Email message ID",
+                },
+                "attachment_id": {
+                    "type": "string",
+                    "description": "Attachment ID",
+                },
+                "attachment_name": {
+                    "type": "string",
+                    "description": "Attachment file name",
+                },
+            },
+            "required": [
+                "message_id",
+                "attachment_id",
+                "attachment_name",
+            ],
+        },
+    },
+},
+{
+    "type": "function",
+    "function": {
+        "name": "send_invoice_to_system_mailbox",
+        "description": (
+            "將已確認的發票附件寄送到指定的系統信箱，"
+            "供後續發票對帳流程使用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "下載後的暫存檔案路徑",
+                },
+                "file_name": {
+                    "type": "string",
+                    "description": "發票檔案名稱",
+                },
+                "invoice_number": {
+                    "type": "string",
+                    "description": "發票號碼",
+                },
+            },
+            "required": [
+                "file_path",
+                "file_name",
+                "invoice_number",
+            ],
+        },
+    },
+},
 ]
 
 # ============================================================
@@ -265,6 +429,41 @@ def execute_tool(name: str, arguments: dict) -> str:
                 st.session_state.user_token,
             )
             return json.dumps(result, ensure_ascii=False)
+        
+        if name == "get_reconciliation_status":
+            result = get_reconciliation_status(
+                arguments["invoice_number"]
+            )
+            return json.dumps(
+                result,
+                ensure_ascii=False
+            )
+        
+        if name == "download_invoice_attachment":
+            result = download_invoice_attachment(
+                arguments["message_id"],
+                arguments["attachment_id"],
+                arguments["attachment_name"],
+                st.session_state.user_token,
+            )
+
+            return json.dumps(
+                result,
+                ensure_ascii=False
+            )
+        
+        if name == "send_invoice_to_system_mailbox":
+            result = send_invoice_to_system_mailbox(
+                arguments["file_path"],
+                arguments["file_name"],
+                arguments["invoice_number"],
+                st.session_state.user_token,
+            )
+
+            return json.dumps(
+                result,
+                ensure_ascii=False
+            )
 
         return json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as e:
@@ -310,7 +509,43 @@ SYSTEM_PROMPT = """
         - If multiple versions of same invoice exist, select LATEST version
         - If unsure if it's an update, check the conversation context
         - Only select the FINAL, MOST RECENT valid invoice
-        - Once valid invoice identified, mark it as processed and move to archive
+        When a valid invoice has been identified:
+
+        1. Analyze the invoice and identify the invoice number.
+
+        2. ALWAYS call get_reconciliation_status(invoice_number)
+        before taking any action.
+
+        3. If the reconciliation status indicates that the invoice
+        can be automatically processed:
+
+        a. Download the selected invoice attachment using
+            download_invoice_attachment.
+
+        b. Send the downloaded invoice attachment to the
+            system mailbox using send_invoice_to_system_mailbox.
+
+        4. If sending the invoice succeeds:
+        Report the successful submission.
+
+        5. If sending the invoice fails:
+        DO NOT mark the invoice as processed.
+        DO NOT move the original email.
+        Report the failure.
+
+        6. If the reconciliation status indicates that the invoice
+        has already been successfully processed:
+        DO NOT automatically replace or resend the invoice.
+        Return "Review Required".
+
+        IMPORTANT:
+        The reconciliation database is the source of truth for the
+        current invoice processing state.
+
+        The LLM is responsible for understanding email context and
+        selecting the appropriate tools.
+
+        The backend is responsible for enforcing business rules.
 
         - Only analyze PDF attachments (ignore images, documents, etc).
         - If a later email explicitly says an earlier invoice should be disregarded, exclude it.
@@ -357,36 +592,47 @@ SYSTEM_PROMPT = """
 """
 
 def run_agent(user_request: str):
-    """執行 AI Agent"""
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        },
+    """執行 AI Agent，保留多輪對話"""
+
+    # 如果是第一次對話，建立 system prompt
+    if not st.session_state.chat_messages:
+        st.session_state.chat_messages.append(
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            }
+        )
+
+    # 加入使用者訊息
+    st.session_state.chat_messages.append(
         {
             "role": "user",
             "content": user_request,
-        },
-    ]
+        }
+    )
 
     execution_trace = []
 
     while True:
         response = client.chat.completions.create(
             model="gpt-5.6-luna",
-            messages=messages,
+            messages=st.session_state.chat_messages,
             tools=TOOLS,
             tool_choice="auto",
         )
 
         message = response.choices[0].message
-        messages.append(message)
 
-        # No tool call → final answer
+        # 將 assistant message 存進 conversation
+        st.session_state.chat_messages.append(
+            message.model_dump(exclude_none=True)
+        )
+
+        # 沒有 tool call → Agent 最終回答
         if not message.tool_calls:
             return message.content, execution_trace
 
-        # Execute tools
+        # 執行 tools
         for tool_call in message.tool_calls:
             tool_name = tool_call.function.name
             arguments = json.loads(tool_call.function.arguments)
@@ -400,14 +646,13 @@ def run_agent(user_request: str):
 
             result = execute_tool(tool_name, arguments)
 
-            messages.append(
+            st.session_state.chat_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "content": result,
                 }
             )
-
 # ============================================================
 # Streamlit UI
 # ============================================================
@@ -445,6 +690,47 @@ with col3:
             logout()
     else:
         st.write("")
+
+st.divider()
+if st.button("🔄 Refresh Emails"):
+    st.rerun()
+# ============================================================
+# 未讀發票郵件摘要（登入後顯示）
+# ============================================================
+
+if st.session_state.user_token:
+    st.subheader("📬 未讀發票郵件")
+
+    with st.spinner("載入郵件中..."):
+        emails_data = get_emails_from_outlook(st.session_state.user_token)
+
+    if emails_data and "emails" in emails_data:
+        emails_list = emails_data.get("emails", [])
+
+        if emails_list:
+            st.success(f"✉️ 找到 **{len(emails_list)}** 封未讀發票郵件")
+
+            # 顯示郵件列表
+            for idx, email in enumerate(emails_list, 1):
+                with st.expander(f"📧 [{idx}] {email['subject']}", expanded=(idx == 1)):
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.caption(f"**寄件者**: {email['from']}")
+                        st.caption(f"**時間**: {email['received_time']}")
+                        if email['body_preview']:
+                            st.caption(f"**預覽**: {email['body_preview'][:100]}...")
+
+                    with col2:
+                        if email['has_attachments']:
+                            st.markdown(f"📎 **{len(email['attachments'])} 個附件**")
+                            for att in email['attachments']:
+                                st.caption(f"• {att['name']}")
+                        else:
+                            st.caption("無附件")
+        else:
+            st.info("✅ 目前沒有未讀的發票郵件")
+    else:
+        st.error("❌ 無法載入郵件")
 
 st.divider()
 
@@ -527,38 +813,98 @@ else:
     # Agent 請求
     # ============================================================
 
-    st.subheader("🤖 Agent 請求")
-    user_request = st.text_input(
-        "請輸入要求:",
-        value="從 Outlook 找出最新的有效發票",
+    # st.subheader("🤖 Agent 請求")
+    # user_request = st.chat_input(
+    #     "請輸入要求:"
+    # )
+
+    # if st.button("🚀 執行 Agent", type="primary"):
+    #     if not backend_health:
+    #         st.error("❌ 無法連接後端。請確保後端正在運行: python backend.py")
+    #     else:
+    #         st.divider()
+    #         st.subheader("🔎 Agent 執行過程")
+    #         with st.spinner("Agent 正在處理..."):
+    #             try:
+    #                 answer, trace = run_agent(user_request)
+
+    #                 # Execution trace
+    #                 for index, step in enumerate(trace, start=1):
+    #                     tool = step["tool"]
+    #                     arguments = step["arguments"]
+
+    #                     st.write(f"**步驟 {index}:** `{tool}`")
+    #                     if arguments:
+    #                         st.caption(f"參數: {json.dumps(arguments, ensure_ascii=False)}")
+
+    #                 # Final result
+    #                 st.divider()
+    #                 st.subheader("📋 Agent 結果")
+    #                 st.markdown(answer)
+
+    #             except Exception as e:
+    #                 st.error(f"❌ 執行失敗: {str(e)}")
+
+
+    st.subheader("🤖 Invoice Agent")
+
+    # 顯示歷史對話
+    for message in st.session_state.chat_messages:
+
+        # 不顯示 system prompt
+        if message["role"] == "system":
+            continue
+
+        # 不直接顯示 tool message
+        if message["role"] == "tool":
+            continue
+
+        if message["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(message["content"])
+
+        elif message["role"] == "assistant":
+            with st.chat_message("assistant"):
+                st.markdown(message.get("content", ""))
+
+
+    # Chat input
+    user_request = st.chat_input(
+        "例如：幫我找最新的有效發票"
     )
 
-    if st.button("🚀 執行 Agent", type="primary"):
-        if not backend_health:
-            st.error("❌ 無法連接後端。請確保後端正在運行: python backend.py")
-        else:
-            st.divider()
-            st.subheader("🔎 Agent 執行過程")
+    if user_request:
+
+        # 顯示使用者訊息
+        with st.chat_message("user"):
+            st.markdown(user_request)
+
+        # Agent 回覆
+        with st.chat_message("assistant"):
             with st.spinner("Agent 正在處理..."):
                 try:
                     answer, trace = run_agent(user_request)
 
-                    # Execution trace
-                    for index, step in enumerate(trace, start=1):
-                        tool = step["tool"]
-                        arguments = step["arguments"]
-
-                        st.write(f"**步驟 {index}:** `{tool}`")
-                        if arguments:
-                            st.caption(f"參數: {json.dumps(arguments, ensure_ascii=False)}")
-
-                    # Final result
-                    st.divider()
-                    st.subheader("📋 Agent 結果")
                     st.markdown(answer)
+
+                    # 顯示 Agent tool execution
+                    if trace:
+                        with st.expander("🔎 Agent Execution Trace"):
+                            for index, step in enumerate(trace, start=1):
+                                tool = step["tool"]
+                                arguments = step["arguments"]
+
+                                st.write(
+                                    f"**Step {index}:** `{tool}`"
+                                )
+
+                                if arguments:
+                                    st.caption(
+                                        json.dumps(
+                                            arguments,
+                                            ensure_ascii=False
+                                        )
+                                    )
 
                 except Exception as e:
                     st.error(f"❌ 執行失敗: {str(e)}")
-
-st.divider()
-st.caption("💡 提示: 確保環境變數已設置 (AAD_CLIENT_ID, AAD_TENANT_ID, AAD_CLIENT_SECRET, OPENAI_API_KEY)")
